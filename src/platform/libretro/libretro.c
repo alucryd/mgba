@@ -43,6 +43,10 @@ FS_Archive sdmcArchive;
 #endif
 
 #include "libretro_core_options.h"
+#ifdef HAVE_ORE
+#include <strings.h>
+#include <smelt.h>
+#endif
 
 #define GBA_AUDIO_CHUNK_FRAMES 1024
 #define GB_SAMPLES 512
@@ -1332,8 +1336,12 @@ void retro_get_system_info(struct retro_system_info* info) {
 #else
 	info->need_fullpath = false;
 #endif
-#ifdef M_CORE_GB
+#if defined(M_CORE_GB) && defined(HAVE_ORE)
+	info->valid_extensions = "gba|gb|gbc|sgb|ore";
+#elif defined(M_CORE_GB)
 	info->valid_extensions = "gba|gb|gbc|sgb";
+#elif defined(HAVE_ORE)
+	info->valid_extensions = "gba|ore";
 #else
 	info->valid_extensions = "gba";
 #endif
@@ -1971,6 +1979,64 @@ error:
 }
 #endif
 
+#ifdef HAVE_ORE
+/* logCallback is NULL when the frontend has no log interface */
+#define _oreError(...) do { if (logCallback) logCallback(RETRO_LOG_ERROR, __VA_ARGS__); } while (0)
+
+static bool _isOre(const char* path) {
+	size_t len = path ? strlen(path) : 0;
+	return len >= 4 && strcasecmp(path + len - 4, ".ore") == 0;
+}
+
+/* Read an ORE, oxyromon's ROM format, through libsmelt into data and
+ * dataSize, as the ROM it holds; mCoreFindVF then tells GBA from GB by the
+ * bytes. false with the reason logged when it is no ROM this core runs. */
+static bool _loadOreRom(const char* path) {
+	struct smelt_ingot* ingot = NULL;
+	uint64_t size = 0;
+	char platform[32];
+	size_t platformLen = sizeof(platform);
+
+	if (smelt_open(path, NULL, &ingot) != SMELT_OK ||
+	    smelt_logical_size(ingot, &size) != SMELT_OK ||
+	    smelt_platform(ingot, platform, &platformLen) != SMELT_OK) {
+		_oreError("ORE %s: %s\n", path, smelt_last_error());
+		smelt_close(ingot);
+		return false;
+	}
+
+	if (strcmp(platform, "gba") != 0
+#ifdef M_CORE_GB
+	    && strcmp(platform, "gb") != 0 && strcmp(platform, "gbc") != 0
+#endif
+	) {
+		_oreError("ORE %s is a %s ROM, which mGBA does not run\n", path, platform);
+		smelt_close(ingot);
+		return false;
+	}
+
+	/* The largest GBA carts are 32 MiB, Game Boy ones 8 */
+	if (size == 0 || size > GBA_SIZE_ROM0) {
+		_oreError("ORE %s holds %llu bytes, too many for a %s ROM\n",
+		            path, (unsigned long long) size, platform);
+		smelt_close(ingot);
+		return false;
+	}
+
+	dataSize = size;
+	data = anonymousMemoryMap(dataSize);
+	if (smelt_read(ingot, 0, data, dataSize) != SMELT_OK) {
+		_oreError("ORE %s: %s\n", path, smelt_last_error());
+		smelt_close(ingot);
+		mappedMemoryFree(data, dataSize);
+		data = NULL;
+		return false;
+	}
+	smelt_close(ingot);
+	return true;
+}
+#endif
+
 bool retro_load_game(const struct retro_game_info* game) {
 	struct VFile* rom;
 
@@ -1978,6 +2044,16 @@ bool retro_load_game(const struct retro_game_info* game) {
 		return false;
 	}
 
+#ifdef HAVE_ORE
+	/* need_fullpath is off, so game->data holds the .ore's own bytes; the
+	 * frontend still passes the path, which is what libsmelt reads */
+	if (_isOre(game->path)) {
+		if (!_loadOreRom(game->path)) {
+			return false;
+		}
+		rom = VFileFromMemory(data, dataSize);
+	} else
+#endif
 	if (game->data) {
 		data = anonymousMemoryMap(game->size);
 		dataSize = game->size;
@@ -2003,7 +2079,7 @@ bool retro_load_game(const struct retro_game_info* game) {
 	core = mCoreFindVF(rom);
 	if (!core) {
 		rom->close(rom);
-		mappedMemoryFree(data, game->size);
+		mappedMemoryFree(data, dataSize);
 		return false;
 	}
 	mCoreInitConfig(core, NULL);
